@@ -3,8 +3,6 @@
 //
 
 #include "storage_mgr.h"
-#include "stdio.h"
-#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 void initStorageManager(void) {
@@ -19,7 +17,7 @@ RC createPageFile(char *fileName) {
         return RC_FILE_NOT_FOUND;
     if (!fwrite(c_size, sizeof(char), PAGE_SIZE, p))
         return RC_WRITE_FAILED;
-    if (fclose(p))
+    if (fclose(p) != 0)
         return RC_FILE_NOT_FOUND;
     return RC_OK;
 }
@@ -45,9 +43,6 @@ RC openPageFile(char *fileName, SM_FileHandle *fHandle) {
 RC closePageFile(SM_FileHandle *fHandle) {
     if (fclose(fHandle->mgmtInfo) != 0)
         return RC_FILE_NOT_FOUND;
-
-    fHandle->mgmtInfo = NULL; // so we don't try to re-close it or use after closed.
-
     return RC_OK;
 }
 
@@ -59,9 +54,10 @@ RC destroyPageFile(char *fileName) {
 
 /* reading blocks from disc */
 RC readBlock(int pageNum, SM_FileHandle *fHandle, SM_PageHandle memPage) {
-
+    if(!fHandle)
+        return RC_FILE_HANDLE_NOT_INIT;
     FILE *fp = fHandle->mgmtInfo;
-    if (!fHandle || !fp)
+    if (!fp)
         return RC_FILE_HANDLE_NOT_INIT;
     if (pageNum < 0 || pageNum > fHandle->totalNumPages)
         return RC_READ_NON_EXISTING_PAGE;
@@ -106,11 +102,13 @@ RC readLastBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
 
 /* writing blocks to a page file */
 RC writeBlock(int pageNum, SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if(!fHandle)
+        return RC_FILE_HANDLE_NOT_INIT;
 
     int RC;
     FILE* fp = fHandle->mgmtInfo;
 
-    if(!fHandle || !fp)
+    if(!fp)
         return RC_FILE_HANDLE_NOT_INIT;
     if (pageNum < 0)
         return RC_WRITE_FAILED;
@@ -135,10 +133,7 @@ RC writeCurrentBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
 }
 
 RC appendEmptyBlock(SM_FileHandle *fHandle) {
-    SM_PageHandle addon = (SM_PageHandle) calloc(PAGE_SIZE, sizeof(char));
-
-    if (!addon)
-        return -1; // Could not allocate memory
+    SM_PageHandle addon[PAGE_SIZE] = {'\0'};
 
     if (fseek(fHandle->mgmtInfo, 0, SEEK_END) == 0) {
         if (fwrite(addon, sizeof(char), PAGE_SIZE, fHandle->mgmtInfo)) {
@@ -152,7 +147,7 @@ RC appendEmptyBlock(SM_FileHandle *fHandle) {
 
 RC ensureCapacity(int numberOfPages, SM_FileHandle *fHandle) {
     int RC;
-    while (fHandle->totalNumPages <= numberOfPages)
+    while (fHandle->totalNumPages < numberOfPages)
         if ((RC = appendEmptyBlock(fHandle)) != RC_OK)
             return RC;
     return RC_OK;

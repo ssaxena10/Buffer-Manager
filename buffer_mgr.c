@@ -15,19 +15,23 @@ typedef struct PageFrame {
     int fixcount;
     int counter;     // if it's FIFO, when this page was written into memory
                      // if it's LRU, when this page was last used
-    struct PageFrame *next; // for use by the CLOCK alg; circular
-    struct PageFrame *prev; // for use by the CLOCK alg; circular
+                     // if it's CLOCK, this is either 0 or 1
+                     // if it's LFU, increment whenever a page pins it
+
+    // for LFU-K, an array of timestamps for the last access
+    int *accesses;
 } PageFrame;
 
 typedef struct Metadata {
     PageFrame *frames; // array of frames
-    PageFrame *cur;    // current position in the buffer
-    int curCounter;    // used by FIFO/LRU to set their counter
+    int curCounter;    // used by FIFO/LRU/CLOCK to set their counter
                        // FIFO: curCounter maintains the count of memory accesses
                        // LRU: curCounter maintains the list of pinning
+                       // CLOCK: this is simply the index of the current frame we're looking at
+
+    // add statistics here
     int numRead;
     int numWrite;
-    // add statistics here
 } Metadata;
 /*
  * Creates a new buffer pool for an existing page file
@@ -46,21 +50,25 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
     bm->numPages = numPages;
 
     bm->strategy = strategy;
+
     Metadata *m = malloc(sizeof(struct Metadata));
     m->frames = malloc(sizeof(PageFrame) * numPages);
-
     m->numRead = 0;
     m->numWrite = 0;
+
     // init the pageframes as empty
     for(int i = 0; i < bm->numPages; i++){
         m->frames[i].frame = (BM_PageHandle){NO_PAGE, NULL};
         m->frames[i].dirty = FALSE;
         m->frames[i].fixcount = 0;
         m->frames[i].counter = -1;
-        m->frames[i].next = NULL;
-        m->frames[i].prev = NULL;
+        if(strategy == RS_LRU_K)
+            m->frames[i].accesses = calloc((int)stratData, sizeof(int));
     }
-    m->cur = &m->frames[0];
+    if(strategy == RS_LRU_K)
+        m->curCounter = (int)stratData;
+    else
+        m->curCounter = 1;
     bm->mgmtData = m;
     return RC_OK;
 }
@@ -82,9 +90,10 @@ RC shutdownBufferPool(BM_BufferPool *const bm){
     if (forceFlushPool(bm) != RC_OK)
         return RC_WRITE_FAILED;
     // free the page data
-    for(int i = 0; i < bm->numPages; i++)
-        if(pages[i].frame.data) // else it was never used and thus malloc'd, so we can't free.
+    for(int i = 0; i < bm->numPages; i++) {
+        if (pages[i].frame.data) // else it was never used and thus malloc'd, so we can't free.
             free(pages[i].frame.data);
+    }
     free(pages);
     free(bm->mgmtData);
     return RC_OK;
@@ -108,7 +117,10 @@ RC forceFlushPool(BM_BufferPool *const bm){
     }
     return RC_OK;
 }
-
+/*
+ * Finds a page given the pagenum
+ * ideally we'd have a hashmap or something, but for now its just a simple array
+ */
 PageFrame* findPage(BM_BufferPool *const bm, PageNumber pageNum){
     Metadata *meta = bm->mgmtData;
     PageFrame *pages = meta->frames;
@@ -117,6 +129,19 @@ PageFrame* findPage(BM_BufferPool *const bm, PageNumber pageNum){
         if(pages[i].frame.pageNum == pageNum)
             return &pages[i];
     return NULL;
+}
+/*
+ * dumb max-heap implementation
+ */
+void updateLRU_K(Metadata *const meta, PageFrame *page, PageNumber counter){
+    int maxK = meta->curCounter;
+    int *arr = page->accesses;
+
+    // iterate from n ... 1
+    // move n - 1 to n
+    for(int i = maxK - 1; i > 1; i--)
+        arr[i] = arr[i - 1];
+    arr[0] = counter;
 }
 
 // Buffer Manager Interface Access Pages
@@ -179,7 +204,7 @@ RC setupNewPage(BM_BufferPool *bm,
     if(frame->frame.data)
         free(frame->frame.data); // wipe out the old data
     page->data = (char *) malloc(PAGE_SIZE); // and in with the new
-    if (ensureCapacity(page->pageNum+1, &fh) != RC_OK)
+    if (ensureCapacity(pageNum+1, &fh) != RC_OK)
         return RC_WRITE_FAILED;  // in case the client just wants to write a new page
     if (readBlock(pageNum, &fh, page->data) != RC_OK)
         return RC_WRITE_FAILED;
@@ -193,46 +218,46 @@ RC setupNewPage(BM_BufferPool *bm,
 
     if(bm->strategy == RS_CLOCK)
         frame->counter = 1;
+    else if (bm->strategy == RS_LRU_K)
+        updateLRU_K(meta, frame, meta->curCounter);
     else
         frame->counter = meta->curCounter;
-
-    // maintain the circular buffer for CLOCK
-    frame->prev = meta->cur;
-    meta->cur->next = frame;
-    meta->cur = frame;
     return RC_OK;
 }
+
 RC CLOCK(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber pageNum){
     Metadata *meta = (Metadata *) bm->mgmtData;
-    PageFrame *cur = meta->cur;
+    PageFrame *cur;
 
-    // if meta->cur is usable, we'll just use that and not move
-    // else, we'll circle around till we find something that is useable.
-    if(cur->fixcount == 0 && cur->counter == 0){
-        if(cur->dirty == TRUE)
-            forcePage(bm, &cur->frame);
-        setupNewPage(bm, cur, page, pageNum);
-        return RC_OK;
-    }
-    else
-        cur = cur->next;
-    // cur shouldn't find NULL because that means we had an free pageframe that had never been used
-    // which should have been caught earlier by pinPage
-    while(cur != meta->cur){
-        if(cur == NULL)
-            return RC_WRITE_FAILED;
+    // from frames[cur] to frames[ejectable], we go through and set the counter to 0
+    // until we find a useable page.
+    int i = meta->curCounter;
+    int fullruns = 0;
+
+    while(true) {
+        cur = &meta->frames[i];
         if(cur->fixcount == 0 && cur->counter == 0){
-            meta->cur = cur;
             if(cur->dirty == TRUE)
                 forcePage(bm, &cur->frame);
             setupNewPage(bm, cur, page, pageNum);
+            meta->curCounter = i; // update the curPointer to the replaced page
             return RC_OK;
         }
+
         cur->counter = 0;
-        cur = cur->next;
+
+        i = (i + 1) % bm->numPages;
+        // we might do a full run if every page started with counter = 1, and got set to 0
+        // but if we do a second full run, then every page must be fixed > 0, which means we can't
+        // eject anything more.
+        if(i == meta->curCounter && ++fullruns >= 2)
+            break;
     }
+
     return RC_WRITE_FAILED;
 }
+
+
 /*
  * pins the page
  *  use page->pagenum to figure out which page to pin in bufferpool
@@ -243,8 +268,10 @@ RC pinPage (BM_BufferPool *const bm, BM_PageHandle *const page,
             const PageNumber pageNum){
     Metadata *meta = bm->mgmtData;
     PageFrame *pages = meta->frames;
-    PageFrame *minPage = &pages[0];
+    PageFrame *minPage = &meta->frames[0];
 
+    // realistically, this entire iteration should be skippable by a hashmap
+    // but it's too much work to implement.
 
     // first check if the page already exists in the pool
     for(int i = 0; i < bm->numPages; i++){
@@ -254,36 +281,57 @@ RC pinPage (BM_BufferPool *const bm, BM_PageHandle *const page,
             page->pageNum = pageNum;
             page->data = pages[i].frame.data;
             // The only place LRU is different from FIFO: It's counter is updated when re-pinned.
-            if(bm->strategy == RS_LRU)
-                pages[i].counter = ++meta->curCounter;
-            if(bm->strategy == RS_CLOCK)
-                pages[i].counter = 1;
+            switch(bm->strategy){
+                case RS_LRU:   pages[i].counter = ++meta->curCounter; break;
+                case RS_LRU_K: updateLRU_K(meta, &pages[i], ++meta->curCounter); break;
+                case RS_LFU:   pages[i].counter++; break;
+                case RS_CLOCK:
+                    pages[i].counter = 1;
+                    meta->curCounter = i;
+                    break;
+                default: break;
+            }
             return RC_OK;
         }
 
         // we don't have the page currently, but we have space for a new page
         if(pages[i].frame.data == NULL) {
             setupNewPage(bm, &pages[i], page, pageNum);
+            if(bm->strategy == RS_CLOCK)
+                meta->curCounter = i;
             return RC_OK;
         }
 
-        // the FIFO/LRU page to replace
-        if(pages[i].fixcount == 0 && pages[i].counter < minPage->counter)
+        if(minPage->fixcount != 0)
             minPage = &pages[i];
+
+        // the FIFO/LRU/LFU page to replace
+        if (pages[i].fixcount == 0){
+            int maxK = meta->curCounter;
+            if (bm->strategy == RS_LRU_K && pages[i].accesses[maxK] < minPage->accesses[maxK])
+                minPage = &pages[i];
+            else if (pages[i].counter < minPage->counter)
+                minPage = &pages[i];
+        }
     }
+    if(minPage->fixcount != 0) // no page was unpinned; client error.
+        return RC_WRITE_FAILED;
 
 
     // now we're adding a new page, so FIFO/LIFO
-    if(bm->strategy == RS_FIFO || bm->strategy == RS_LRU)
+    if(bm->strategy == RS_FIFO || bm->strategy == RS_LRU || bm->strategy == RS_LRU_K)
         meta->curCounter++; // we'll use the next value for new pages
 
 
 
     // since we don't have a free page, we'll have to use the replacement strategy to find a new one
     switch(bm->strategy){
-        // FIFO/LRU set their counter's to the max of frame-list, so their logic for a new page is exactly the same
+
+        // FIFO/LRU/LFU/LRU_K set their counter's to the max of frame-list, so their logic for a new page is exactly the same
         case RS_FIFO:
         case RS_LRU:
+        case RS_LRU_K:
+        case RS_LFU:
             if(minPage->dirty)
                 forcePage(bm, &minPage->frame);
             if (setupNewPage(bm, minPage, page, pageNum) != RC_OK)
@@ -296,10 +344,7 @@ RC pinPage (BM_BufferPool *const bm, BM_PageHandle *const page,
             if (CLOCK(bm, page, pageNum) != RC_OK)
                 return RC_WRITE_FAILED;
             break;
-        case RS_LFU:
-            break;
-        case RS_LRU_K:
-            break;
+
         default:
             break;
     }
